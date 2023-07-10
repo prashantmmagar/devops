@@ -1,0 +1,3 @@
+#!/usr/bin/sh
+cmd=${0##*/}
+exec grep -E "$@"

@@ -1,0 +1,176 @@
+#!/usr/bin/bash
+#
+# Copyright Amazon.com, Inc. or its affiliates.
+# SPDX-License-Identifier: GPL-3.0
+#
+# Script for setting up grub2 on Amazon Linux systems
+#
+# This will install the BIOS grub on the BIOS boot partition if present
+# and will setup the stub config on the EFI partition for EFI grub
+
+set -e
+
+VERBOSE=false
+YES=false
+HAS_EFI=false
+HAS_BIOS=false
+EFI_MOUNT=/boot/efi
+BLKID_FILE=/dev/null
+UPDATECHECK=false
+
+log() {
+    if "$VERBOSE" = true; then
+	echo $@
+    fi
+}
+
+err() {
+    echo $@ >&2
+    exit 1
+}
+
+function ask() {
+    if [ "$YES" = false ]; then
+	echo ""
+	while true; do
+	    read -p "$@" yn
+	    case $yn in
+		[Yy]* ) break;;
+		[Nn]* ) exit 0;;
+	    esac
+	done
+    fi
+}
+
+uppercase() {
+    echo $@ | tr '[a-z]' '[A-Z]'
+}
+
+copy() {
+    log "Copying $1 to $2"
+    cp "$1" "$2"
+}
+
+function do_setup_bios() {
+    # Nothing to do when just doing an update check
+    if [ "$UPDATECHECK" = true ]; then
+	return
+    fi
+    echo "Setting up grub2 for BIOS boot"
+
+    ask "Do you want to overwrite grub on ${BOOT_DEV_PARENT} ? (y/n) "
+
+    grub2-install --target=i386-pc ${BOOT_DEV_PARENT}
+}
+
+function do_setup_efi() {
+    # Create the stub .cfg file in EFI/amzn that references the real one
+    EFI_DIST="$EFI_MOUNT"/EFI/amzn
+    STUB_CFG="$EFI_DIST/grub.cfg"
+
+    # On update check, only do this if it doesn't already exist
+    if [ "$UPDATECHECK" = true ]; then
+	if [ -f $STUB_CFG ]; then
+	    return;
+	fi
+    fi
+
+    echo "Creating $STUB_CFG..."
+
+    # Get UUID of filesystem with /boot on it
+    BOOT_UUID=$(grub2-probe /boot -t fs_uuid)
+    # Make mountpoint-relative path to /boot/grub2
+    BOOT_RPATH=$(grub2-mkrelpath /boot/grub2)
+
+    # Create /boot/efi/EFI/amzn in case it doesn't already
+    mkdir -p -m 700 "$EFI_DIST"
+
+    # Generate the "stub" config file that locates the real one and
+    # loads it
+    cat >"$STUB_CFG" <<EOF
+search.fs_uuid ${BOOT_UUID} root
+set no_modules=y
+set prefix=(\$root)'${BOOT_RPATH}'
+configfile \$prefix/grub.cfg
+EOF
+}
+
+# XXX use getopt
+while [ -n "$1" ]; do
+    case "$1" in
+	--verbose | -v)
+	    VERBOSE=true
+	    ;;
+	--yes | -y)
+	    YES=true
+	    ;;
+	--updatecheck | -u)
+	    UPDATECHECK=true
+	    ;;
+	--device | -d)
+	    shift
+	    BOOT_DEV_PARENT=$1
+	    ;;
+    esac
+    shift
+done
+
+# Detect architecture
+ARCH=$(uname -m)
+log "Setting up grub2 for" $ARCH
+
+if [ "$ARCH" = "x86_64" ]; then
+    EFI_ARCH=x64
+elif [ "$ARCH" = "aarch64" ]; then
+    EFI_ARCH=aa64
+else
+    err "Unknown architecture" $ARCH
+fi
+
+# Detect boot device if not specified
+if [ -z ${BOOT_DEV_PARENT+x} ]; then
+    BOOT_DEV=$(grub2-probe /boot -t device)
+    BOOT_DEV_NAME=$(basename $BOOT_DEV)
+    BOOT_DEV_PARENT=$(echo "/dev/"$(basename $(realpath "/sys/class/block/${BOOT_DEV_NAME}/..")))
+    log "Device with /boot:" $BOOT_DEV
+fi
+log "Boot device:" $BOOT_DEV_PARENT
+
+# Detect EFI/BIOS/DUAL setup
+PLIST=$(sgdisk -p $BOOT_DEV_PARENT)
+if [[ $PLIST = *EF00* ]]; then
+    HAS_EFI=true
+    log "Detected EFI partition"
+fi
+if [ "$ARCH" = "x86_64" ]; then
+    if [[ $PLIST = *EF02* ]]; then
+	HAS_BIOS=true
+	log "Detected BIOS BOOT partition"
+    fi
+fi
+
+# Also install EFI artifacts if /boot/efi/EFI/amzn exists, so that
+# install tests done on a BIOS system can work
+if [ "$HAS_EFI" = false ] && [ -d /boot/efi/EFI/amzn ]; then
+    log "Forcing EFI detection due to /boot/efi/EFI/amzn presence"
+    HAS_EFI=true
+fi
+
+if [ $HAS_EFI = false -a $HAS_BIOS = false ]; then
+     err "Neither BIOS not EFI partition detected, aborting"
+fi
+
+if [ $HAS_BIOS = true ]; then
+    do_setup_bios
+fi
+
+if [ $HAS_EFI = true ]; then
+    do_setup_efi
+fi
+
+if [ "$UPDATECHECK" = false ]; then
+    echo "Rebuilding grub config..."
+    grub2-mkconfig -o /boot/grub2/grub.cfg
+    chmod 0600 /boot/grub2/grub.cfg
+fi
+
